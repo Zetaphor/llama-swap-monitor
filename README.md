@@ -22,9 +22,12 @@ One-line status output for [llama-swap](https://github.com/mostlygeek/llama-swap
 
 ```bash
 chmod +x llama-swap-monitor.sh
-export LLAMA_SWAP_API=http://192.168.50.240:10080   # your llama-swap host
+mkdir -p ~/.config/llama-swap-monitor
+printf '%s\n' 'LLAMA_SWAP_API=http://192.168.50.240:10080' > ~/.config/llama-swap-monitor/config
 ./llama-swap-monitor.sh
 ```
+
+KDE panel widgets run with a minimal environment (no shell profile), so use the config file above rather than relying on `export` in `.bashrc`.
 
 ### KDE Command Output widget
 
@@ -39,6 +42,11 @@ export LLAMA_SWAP_API=http://192.168.50.240:10080
 ```
 
 ## Configuration
+
+| Source | Description |
+|--------|-------------|
+| `~/.config/llama-swap-monitor/config` | Shell snippet sourced by the script (recommended for KDE) |
+| `LLAMA_SWAP_API` env var | Overrides config file if set |
 
 | Variable | Default | Description |
 |----------|---------|-------------|

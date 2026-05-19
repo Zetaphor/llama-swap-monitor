@@ -2,6 +2,13 @@
 # Outputs llama-swap status as a single line for the KDE Command Output widget.
 # Configure the widget to run this script every 2–4 seconds.
 
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/llama-swap-monitor"
+CONFIG_FILE="$CONFIG_DIR/config"
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+fi
+
 export LLAMA_SWAP_API="${LLAMA_SWAP_API:-http://127.0.0.1:10080}"
 
 /usr/bin/python3 <<'PY'
