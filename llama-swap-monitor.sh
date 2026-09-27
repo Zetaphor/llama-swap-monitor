@@ -309,22 +309,47 @@ def read_sse_snapshot():
     }
 
 
-def inflight_activity(inflight_obj):
+def inflight_busy_info(inflight_obj):
+    # returns (busy, model, elapsed_s, n_requests); llama-swap refreshes
+    # elapsed_ms on every inflight event, so it is current as of this poll.
     if not isinstance(inflight_obj, dict):
-        return False, None
+        return False, None, None, None
     op = inflight_obj.get("operation")
     if op == "remove":
-        return False, None
+        return False, None, None, None
     if op == "snapshot":
         reqs = inflight_obj.get("requests") or []
         if reqs:
-            model = reqs[0].get("model")
-            return True, model
-        return False, None
+            elapsed = None
+            for req in reqs:
+                try:
+                    ms = float(req.get("elapsed_ms") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if elapsed is None or ms > elapsed:
+                    elapsed = ms
+            return True, reqs[0].get("model"), int(elapsed / 1000) if elapsed is not None else None, len(reqs)
+        return False, None, None, None
     req = inflight_obj.get("request")
     if isinstance(req, dict):
-        return True, req.get("model")
-    return False, None
+        try:
+            ms = float(req.get("elapsed_ms") or 0)
+        except (TypeError, ValueError):
+            ms = None
+        return True, req.get("model"), int(ms / 1000) if ms is not None else None, None
+    return False, None, None, None
+
+
+def fmt_busy(elapsed_s, n_requests):
+    if elapsed_s is None:
+        base = "Busy"
+    elif elapsed_s >= 600:
+        base = f"Busy {elapsed_s // 60}m"
+    else:
+        base = f"Busy {elapsed_s}s"
+    if isinstance(n_requests, int) and n_requests > 1:
+        base += f" ×{n_requests}"
+    return base
 
 
 def alive():
@@ -498,7 +523,7 @@ if ports:
                 slot_model = ports.get(port)
                 break
 
-inflight_active, inflight_model = inflight_activity(inflight)
+inflight_active, inflight_model, inflight_elapsed, inflight_n = inflight_busy_info(inflight)
 
 gufo_act = None
 gufo_model = None
@@ -580,7 +605,7 @@ if has_live_activity:
         elif prompt_pct is not None:
             label = f"🟡 Prompt {prompt_pct}%"
         elif inflight_active:
-            label = "🟡 Busy"
+            label = f"🟡 {fmt_busy(inflight_elapsed, inflight_n)}"
         else:
             label = "🟡 Prompt"
 
