@@ -13,6 +13,7 @@ export LLAMA_SWAP_API="${LLAMA_SWAP_API:-http://127.0.0.1:10080}"
 export LLAMA_SWAP_MONITOR_STATE_FILE="${LLAMA_SWAP_MONITOR_STATE_FILE:-${XDG_RUNTIME_DIR:-/tmp}/llama-swap-monitor-state.json}"
 
 /usr/bin/python3 <<'PY'
+import calendar
 import json
 import os
 import re
@@ -38,6 +39,10 @@ PROMPT_PCT_STICKY_SECONDS = 5.0
 GEN_TPS_HOLD_SECONDS = 1.5
 GEN_TPS_EMA_ALPHA = 0.55
 GUFO_PHASE_HOLD_SECONDS = 8.0
+# gufo --log-progress emits one line per prefill chunk and every 50 decoded
+# tokens (~1-1.5 s apart in practice). A line older than this means generation
+# is not actually advancing, so stop replaying it.
+GUFO_PROGRESS_FRESH_SECONDS = 6.0
 OFFLINE_GRACE_SECONDS = 15.0
 
 
@@ -91,6 +96,76 @@ def latest_upstream_activity(log_text: str):
             m = re.search(r"n_decoded =\s*(\d+)", line)
             if m and ts >= best_ts:
                 best_ts, best = ts, ("gen", int(m.group(1)))
+    return best
+
+
+GUFO_PROGRESS_RE = re.compile(
+    r"\[progress\]\s+request=(\d+)\s+phase=(prefill|decode)\s+tokens=(\d+)/(\d+)\s+"
+    r"percentage=([\d.]+)\s+chunk_tps=([\d.]+)\s+avg_tps=([\d.]+)"
+)
+GUFO_DRAFT_RE = re.compile(
+    r"draft_accepted=(\d+)\s+draft_proposed=(\d+)\s+acceptance_percentage=([\d.]+)"
+)
+
+
+def gufo_progress_epoch(line: str):
+    """gufo stamps its own log lines in UTC (`YYYY-MM-DD HH:MM:SS` before the
+    [INFO] tag). Return the epoch, or None when the line is untimestamped."""
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})", line)
+    if not m:
+        return None
+    try:
+        return calendar.timegm(tuple(int(x) for x in m.groups()) + (0, 0, 0))
+    except (OverflowError, ValueError):
+        return None
+
+
+def latest_gufo_progress(log_text: str):
+    """Parse gufo's --log-progress output into scheduler-authoritative live
+    state, or None when the backend is not gufo or the flag is off.
+
+    Shapes (verified against engine b722a61):
+      [progress] request=1 phase=prefill tokens=113664/134093 percentage=84.8 \
+                 chunk_tps=791.9 avg_tps=842.1
+      [progress] request=2 phase=decode tokens=351/600 percentage=58.5 \
+                 chunk_tps=36.0 avg_tps=33.9 draft_accepted=144 \
+                 draft_proposed=212 acceptance_percentage=67.9
+
+    The newest line in the burst wins, which is whatever the scheduler most
+    recently advanced -- with --sessions 2 a prefilling request legitimately
+    interleaves with a decoding one. Lines older than GUFO_PROGRESS_FRESH_SECONDS
+    are dropped so a finished request stops replaying.
+    """
+    best = None
+    best_epoch = None
+    now = time.time()
+    for line in log_text.splitlines():
+        if "[progress]" not in line:
+            continue
+        m = GUFO_PROGRESS_RE.search(line)
+        if not m:
+            continue
+        epoch = gufo_progress_epoch(line)
+        if epoch is not None and now - epoch > GUFO_PROGRESS_FRESH_SECONDS:
+            continue
+        req, phase, done, total, pct, chunk_tps, avg_tps = m.groups()
+        entry = {
+            "req": int(req),
+            "kind": "gen" if phase == "decode" else "prompt",
+            "done": int(done),
+            "total": int(total),
+            "pct": float(pct),
+            "tps": float(avg_tps),
+            "epoch": epoch,
+        }
+        d = GUFO_DRAFT_RE.search(line)
+        if d:
+            entry["draft_accepted"] = int(d.group(1))
+            entry["draft_proposed"] = int(d.group(2))
+            entry["acceptance_pct"] = float(d.group(3))
+        # Keep the most recent line; fall back to arrival order when untimestamped.
+        if best is None or epoch is None or (best_epoch is None or epoch >= best_epoch):
+            best, best_epoch = entry, epoch
     return best
 
 
@@ -510,6 +585,9 @@ slot_activity = None
 slot_model = None
 gufo_ports = {}
 log_activity = latest_upstream_activity(upstream_log)
+# Authoritative gufo progress (engine >= b722a61 with --log-progress). Wins over
+# the Prometheus-delta inference below, which can only guess the phase.
+gufo_prog = latest_gufo_progress(upstream_log)
 if ports:
     with ThreadPoolExecutor(max_workers=len(ports)) as pool:
         futures = [pool.submit(fetch_port_status, port, 0.25) for port in ports]
@@ -561,10 +639,33 @@ if not model and inflight_model:
 if not model and len(running) == 1:
     model = running[0].get("model") or running[0].get("name")
 
-has_live_activity = bool(slot_activity or gufo_act or inflight_active)
+has_live_activity = bool(slot_activity or gufo_prog or gufo_act or inflight_active)
 
 if has_live_activity:
-    if gufo_act and not slot_activity:
+    if gufo_prog and not slot_activity:
+        # Scheduler-authoritative numbers straight from gufo's progress logger.
+        tps = gufo_prog.get("tps")
+        if gufo_prog.get("kind") == "gen":
+            state_cache.pop("prompt_pct", None)
+            state_cache.pop("prompt_ts", None)
+            parts = [f"⚡ Gen {gufo_prog.get('done', 0)}t"]
+            if isinstance(tps, (int, float)) and tps > 0.05:
+                parts.append(f"{tps:.1f} tok/s")
+            acc = gufo_prog.get("acceptance_pct")
+            if isinstance(acc, (int, float)):
+                parts.append(f"{acc:.0f}% MTP")
+            label = " ".join(parts)
+        else:
+            pct = gufo_prog.get("pct")
+            if isinstance(pct, (int, float)):
+                label = f"🟡 Prompt {pct:.0f}%"
+                if isinstance(tps, (int, float)) and tps > 0.05:
+                    label += f" {tps:.0f} tok/s"
+            elif isinstance(tps, (int, float)) and tps > 0.05:
+                label = f"🟡 Prompt {tps:.0f} tok/s"
+            else:
+                label = "🟡 Prompt"
+    elif gufo_act and not slot_activity:
         tps = gufo_act.get("tps")
         if gufo_act.get("kind") == "gen":
             state_cache.pop("prompt_pct", None)
