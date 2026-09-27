@@ -41,6 +41,11 @@ GUFO_PHASE_HOLD_SECONDS = 8.0
 OFFLINE_GRACE_SECONDS = 15.0
 
 
+def clear_stale_state():
+    for k in ("prompt_pct", "prompt_ts", "gen_prev_model", "gen_prev_decoded", "gen_prev_ts", "gen_tps_ema", "gen_tps_ema_ts"):
+        state_cache.pop(k, None)
+
+
 def request_for(path: str, accept: str = "application/json"):
     headers = {"Accept": accept}
     if API_KEY:
@@ -638,13 +643,7 @@ if has_live_activity:
 elif starting:
     out_line = f"🟡 Starting · {starting[0]}"
     print(out_line)
-    state_cache.pop("prompt_pct", None)
-    state_cache.pop("prompt_ts", None)
-    state_cache.pop("gen_prev_model", None)
-    state_cache.pop("gen_prev_decoded", None)
-    state_cache.pop("gen_prev_ts", None)
-    state_cache.pop("gen_tps_ema", None)
-    state_cache.pop("gen_tps_ema_ts", None)
+    clear_stale_state()
     clear_gufo_state(state_cache, gufo_ports)
     state_cache["last_phase"] = "starting"
     state_cache["last_line"] = out_line
@@ -656,13 +655,7 @@ elif starting:
 elif stopping:
     out_line = f"🟡 Stopping · {stopping[0]}"
     print(out_line)
-    state_cache.pop("prompt_pct", None)
-    state_cache.pop("prompt_ts", None)
-    state_cache.pop("gen_prev_model", None)
-    state_cache.pop("gen_prev_decoded", None)
-    state_cache.pop("gen_prev_ts", None)
-    state_cache.pop("gen_tps_ema", None)
-    state_cache.pop("gen_tps_ema_ts", None)
+    clear_stale_state()
     clear_gufo_state(state_cache, gufo_ports)
     state_cache["last_phase"] = "stopping"
     state_cache["last_line"] = out_line
@@ -678,13 +671,7 @@ else:
     else:
         out_line = f"🟢 Idle · {loaded} loaded / {total}"
         print(out_line)
-    state_cache.pop("prompt_pct", None)
-    state_cache.pop("prompt_ts", None)
-    state_cache.pop("gen_prev_model", None)
-    state_cache.pop("gen_prev_decoded", None)
-    state_cache.pop("gen_prev_ts", None)
-    state_cache.pop("gen_tps_ema", None)
-    state_cache.pop("gen_tps_ema_ts", None)
+    clear_stale_state()
     clear_gufo_state(state_cache, gufo_ports)
     state_cache["last_phase"] = "idle"
     state_cache["last_line"] = out_line
