@@ -33,9 +33,11 @@ TIMEOUT_NORMAL = 0.45
 TIMEOUT_SSE_CONNECT = 0.6
 SSE_WINDOW_SECONDS = 0.35
 SSE_MAX_EVENTS = 20
+SSE_INFLIGHT_GRACE_SECONDS = 0.10
 PROMPT_PCT_STICKY_SECONDS = 5.0
 GEN_TPS_HOLD_SECONDS = 1.5
 GEN_TPS_EMA_ALPHA = 0.55
+GUFO_PHASE_HOLD_SECONDS = 8.0
 OFFLINE_GRACE_SECONDS = 15.0
 
 
@@ -114,6 +116,108 @@ def active_slot(slots):
     return None
 
 
+def classify_backend(slots):
+    # llama.cpp /slots slots carry is_processing; the gufo engine returns a
+    # placeholder payload ({"id","task_id","state",...}) that never changes.
+    if not isinstance(slots, list):
+        return None
+    for slot in slots:
+        if not isinstance(slot, dict):
+            continue
+        if "is_processing" in slot:
+            return "llama"
+        if "task_id" in slot or "state" in slot:
+            return "gufo"
+    return None
+
+
+def fetch_metrics(port: int, timeout=2):
+    url = f"http://{HOST}:{port}/metrics"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8", "replace")
+    except Exception:
+        return port, None
+    values = {}
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            num = float(parts[1])
+        except ValueError:
+            continue
+        if parts[0] == "llamacpp:prompt_tokens_total":
+            values["prompt_total"] = int(num)
+        elif parts[0] == "llamacpp:tokens_predicted_total":
+            values["gen_total"] = int(num)
+        elif parts[0] == "llamacpp:prompt_tokens_seconds":
+            values["prompt_tps"] = num
+        elif parts[0] == "llamacpp:predicted_tokens_seconds":
+            values["decode_tps"] = num
+    return port, values
+
+
+def fetch_port_status(port, timeout=2):
+    port, slots = fetch_slots(port, timeout)
+    backend = classify_backend(slots)
+    metrics = None
+    if backend == "gufo":
+        _, metrics = fetch_metrics(port, timeout)
+    return port, backend, slots, metrics
+
+
+def gufo_activity(state_cache, port, metrics, now_ts, inflight_active):
+    # gufo advances its Prometheus counters only when a request completes, so
+    # infer the phase from per-poll deltas and replay the last observed phase
+    # briefly while a long request keeps running (counters frozen mid-request).
+    gen_total = metrics.get("gen_total")
+    prompt_total = metrics.get("prompt_total")
+    if not isinstance(gen_total, int) or not isinstance(prompt_total, int):
+        return None
+    prev_key = f"gf_prev:{port}"
+    act_key = f"gf_act:{port}"
+    prev = state_cache.get(prev_key)
+    dgen = dprompt = 0
+    if isinstance(prev, dict):
+        try:
+            dt = now_ts - float(prev.get("ts", now_ts))
+            if dt >= 0.05:
+                dgen = max(0, gen_total - int(prev.get("gen", gen_total)))
+                dprompt = max(0, prompt_total - int(prev.get("prompt", prompt_total)))
+        except (TypeError, ValueError):
+            pass
+    state_cache[prev_key] = {"ts": now_ts, "gen": gen_total, "prompt": prompt_total}
+
+    act = None
+    if dgen > 0:
+        act = {"kind": "gen", "gen": gen_total, "tps": metrics.get("decode_tps")}
+    elif dprompt > 0:
+        act = {"kind": "prompt", "gen": gen_total, "tps": metrics.get("prompt_tps")}
+    if act is not None:
+        state_cache[act_key] = dict(act, ts=now_ts)
+        return act
+    if inflight_active:
+        held = state_cache.get(act_key)
+        if (
+            isinstance(held, dict)
+            and isinstance(held.get("ts"), (int, float))
+            and now_ts - float(held["ts"]) <= GUFO_PHASE_HOLD_SECONDS
+        ):
+            return dict(held, held=True)
+    return None
+
+
+def clear_gufo_state(state_cache, live_ports=None):
+    # Keep per-port counter snapshots for ports still running so deltas span
+    # idle polls; everything else (replay state, dead ports) is dropped.
+    live = {f"gf_prev:{port}" for port in (live_ports or [])}
+    for key in [k for k in state_cache if k.startswith("gf_") and k not in live]:
+        del state_cache[key]
+
+
 def parse_outer_event(raw_payload: str):
     try:
         outer = json.loads(raw_payload)
@@ -136,6 +240,8 @@ def read_sse_snapshot():
     sse_ok = False
     got_model_status = False
     got_upstream_log = False
+    saw_inflight = False
+    got_everything_ts = None
     event_count = 0
     started = time.monotonic()
     deadline = started + SSE_WINDOW_SECONDS
@@ -174,8 +280,19 @@ def read_sse_snapshot():
                                 got_upstream_log = True
                     elif kind == "inflight":
                         inflight = inner
+                        saw_inflight = True
 
-                    if got_model_status and got_upstream_log and event_count >= 3:
+                    # Connection burst order is logData -> modelStatus ->
+                    # inflight snapshot, so never break before the snapshot
+                    # arrives; otherwise the busy state stays invisible.
+                    if got_model_status and saw_inflight:
+                        break
+                    if (
+                        got_model_status
+                        and got_upstream_log
+                        and event_count >= 5
+                        and time.monotonic() - started >= SSE_INFLIGHT_GRACE_SECONDS
+                    ):
                         break
                     continue
 
@@ -361,14 +478,19 @@ for proc in running:
 
 slot_activity = None
 slot_model = None
+gufo_ports = {}
 log_activity = latest_upstream_activity(upstream_log)
 if ports:
     with ThreadPoolExecutor(max_workers=len(ports)) as pool:
-        futures = [pool.submit(fetch_slots, port, 0.25) for port in ports]
+        futures = [pool.submit(fetch_port_status, port, 0.25) for port in ports]
         for fut in as_completed(futures, timeout=0.45):
             try:
-                port, slots = fut.result()
+                port, backend, slots, metrics = fut.result()
             except Exception:
+                continue
+            if backend == "gufo":
+                if metrics:
+                    gufo_ports[port] = metrics
                 continue
             active = active_slot(slots)
             if active:
@@ -377,6 +499,17 @@ if ports:
                 break
 
 inflight_active, inflight_model = inflight_activity(inflight)
+
+gufo_act = None
+gufo_model = None
+if not slot_activity and gufo_ports:
+    for port, metrics in gufo_ports.items():
+        act = gufo_activity(state_cache, port, metrics, now_ts, inflight_active)
+        if not act:
+            continue
+        if gufo_act is None or (gufo_act.get("held") and not act.get("held")):
+            gufo_act = act
+            gufo_model = ports.get(port)
 
 state_map = build_state_map(models, running)
 starting = sorted([mid for mid, st in state_map.items() if st == "starting"])
@@ -390,7 +523,7 @@ if not running_ok:
         loaded = int(state_cache["last_loaded"])
 if total is None and isinstance(state_cache.get("last_total"), int):
     total = int(state_cache["last_total"])
-model = slot_model
+model = slot_model or gufo_model
 
 if not model and inflight_model:
     model = inflight_model
@@ -398,56 +531,71 @@ if not model and inflight_model:
 if not model and len(running) == 1:
     model = running[0].get("model") or running[0].get("name")
 
-has_live_activity = bool(slot_activity or inflight_active)
+has_live_activity = bool(slot_activity or gufo_act or inflight_active)
 
 if has_live_activity:
-    decoded = slot_activity["n_decoded"] if slot_activity else 0
-    prompt_pct = None
-    prompt_pct_source = None
-    if decoded > 0:
-        prompt_pct = None
-    elif slot_activity:
-        p_total = slot_activity.get("n_prompt_tokens", 0)
-        p_done = slot_activity.get("n_prompt_tokens_processed", 0)
-        if p_total > 0:
-            prompt_pct = max(0, min(100, int((p_done * 100) / p_total)))
-            prompt_pct_source = "slots"
-    elif log_activity and log_activity[0] == "prompt":
-        prompt_pct = max(0, min(100, int(log_activity[1] * 100)))
-        prompt_pct_source = "log"
-    elif decoded == 0:
-        cached_pct = state_cache.get("prompt_pct")
-        cached_ts = state_cache.get("prompt_ts")
-        if isinstance(cached_pct, int) and isinstance(cached_ts, (int, float)):
-            if now_ts - float(cached_ts) <= PROMPT_PCT_STICKY_SECONDS:
-                prompt_pct = max(0, min(100, cached_pct))
-                prompt_pct_source = "cache"
-
-    if decoded > 0:
-        tps = compute_gen_tps(state_cache, model, decoded, now_ts)
-        if isinstance(tps, (int, float)) and tps > 0.05:
-            label = f"⚡ Gen {decoded}t {tps:.1f} tok/s"
+    if gufo_act and not slot_activity:
+        tps = gufo_act.get("tps")
+        if gufo_act.get("kind") == "gen":
+            state_cache.pop("prompt_pct", None)
+            state_cache.pop("prompt_ts", None)
+            gen_total = gufo_act.get("gen", 0)
+            if isinstance(tps, (int, float)) and tps > 0.05:
+                label = f"⚡ Gen {gen_total}t {tps:.1f} tok/s"
+            else:
+                label = f"⚡ Gen {gen_total}t"
+        elif isinstance(tps, (int, float)) and tps > 0.05:
+            label = f"🟡 Prompt {tps:.0f} tok/s"
         else:
-            label = f"⚡ Gen {decoded}t"
-    elif prompt_pct is not None:
-        label = f"🟡 Prompt {prompt_pct}%"
-    elif inflight_active:
-        label = "🟡 Busy"
+            label = "🟡 Prompt"
     else:
-        label = "🟡 Prompt"
+        decoded = slot_activity["n_decoded"] if slot_activity else 0
+        prompt_pct = None
+        prompt_pct_source = None
+        if decoded > 0:
+            prompt_pct = None
+        elif slot_activity:
+            p_total = slot_activity.get("n_prompt_tokens", 0)
+            p_done = slot_activity.get("n_prompt_tokens_processed", 0)
+            if p_total > 0:
+                prompt_pct = max(0, min(100, int((p_done * 100) / p_total)))
+                prompt_pct_source = "slots"
+        elif log_activity and log_activity[0] == "prompt":
+            prompt_pct = max(0, min(100, int(log_activity[1] * 100)))
+            prompt_pct_source = "log"
+        elif decoded == 0:
+            cached_pct = state_cache.get("prompt_pct")
+            cached_ts = state_cache.get("prompt_ts")
+            if isinstance(cached_pct, int) and isinstance(cached_ts, (int, float)):
+                if now_ts - float(cached_ts) <= PROMPT_PCT_STICKY_SECONDS:
+                    prompt_pct = max(0, min(100, cached_pct))
+                    prompt_pct_source = "cache"
 
-    if prompt_pct is not None and prompt_pct_source in ("slots", "log"):
-        state_cache["prompt_pct"] = int(prompt_pct)
-        state_cache["prompt_ts"] = now_ts
-    elif decoded > 0:
-        state_cache.pop("prompt_pct", None)
-        state_cache.pop("prompt_ts", None)
-    else:
-        state_cache.pop("gen_prev_model", None)
-        state_cache.pop("gen_prev_decoded", None)
-        state_cache.pop("gen_prev_ts", None)
-        state_cache.pop("gen_tps_ema", None)
-        state_cache.pop("gen_tps_ema_ts", None)
+        if decoded > 0:
+            tps = compute_gen_tps(state_cache, model, decoded, now_ts)
+            if isinstance(tps, (int, float)) and tps > 0.05:
+                label = f"⚡ Gen {decoded}t {tps:.1f} tok/s"
+            else:
+                label = f"⚡ Gen {decoded}t"
+        elif prompt_pct is not None:
+            label = f"🟡 Prompt {prompt_pct}%"
+        elif inflight_active:
+            label = "🟡 Busy"
+        else:
+            label = "🟡 Prompt"
+
+        if prompt_pct is not None and prompt_pct_source in ("slots", "log"):
+            state_cache["prompt_pct"] = int(prompt_pct)
+            state_cache["prompt_ts"] = now_ts
+        elif decoded > 0:
+            state_cache.pop("prompt_pct", None)
+            state_cache.pop("prompt_ts", None)
+        else:
+            state_cache.pop("gen_prev_model", None)
+            state_cache.pop("gen_prev_decoded", None)
+            state_cache.pop("gen_prev_ts", None)
+            state_cache.pop("gen_tps_ema", None)
+            state_cache.pop("gen_tps_ema_ts", None)
     if model:
         out_line = f"{label} · {model}"
         print(out_line)
@@ -472,6 +620,7 @@ elif starting:
     state_cache.pop("gen_prev_ts", None)
     state_cache.pop("gen_tps_ema", None)
     state_cache.pop("gen_tps_ema_ts", None)
+    clear_gufo_state(state_cache, gufo_ports)
     state_cache["last_phase"] = "starting"
     state_cache["last_line"] = out_line
     state_cache["last_ok_ts"] = now_ts
@@ -489,6 +638,7 @@ elif stopping:
     state_cache.pop("gen_prev_ts", None)
     state_cache.pop("gen_tps_ema", None)
     state_cache.pop("gen_tps_ema_ts", None)
+    clear_gufo_state(state_cache, gufo_ports)
     state_cache["last_phase"] = "stopping"
     state_cache["last_line"] = out_line
     state_cache["last_ok_ts"] = now_ts
@@ -510,6 +660,7 @@ else:
     state_cache.pop("gen_prev_ts", None)
     state_cache.pop("gen_tps_ema", None)
     state_cache.pop("gen_tps_ema_ts", None)
+    clear_gufo_state(state_cache, gufo_ports)
     state_cache["last_phase"] = "idle"
     state_cache["last_line"] = out_line
     state_cache["last_ok_ts"] = now_ts
