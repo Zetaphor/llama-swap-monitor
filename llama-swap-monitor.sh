@@ -44,6 +44,20 @@ GUFO_PHASE_HOLD_SECONDS = 8.0
 # is not actually advancing, so stop replaying it.
 GUFO_PROGRESS_FRESH_SECONDS = 6.0
 OFFLINE_GRACE_SECONDS = 15.0
+# A finished request's summary stays on the Idle line this long, so the widget
+# briefly shows the cache-hit rate after each turn instead of only during it.
+LAST_STATS_STICKY_SECONDS = 8.0
+
+# Engine notes (gufo 0.5.0 / 23cacbb, deployed 2026-10-02):
+#   #344 (0.4.0): streaming clients may pass return_progress:true and get
+#     prompt_progress {total, cache, processed, time_ms} chunks before the first
+#     token; verified this relay through llama-swap unchanged. The widget makes
+#     no completions of its own, so engine-side sources stand in instead:
+#     --log-progress for live prompt/gen, /metrics for counters.
+#   #351 (0.4.0): /metrics counters advance per prefill chunk / token, i.e.
+#     during the request, not only when it completes.
+#   #358/#362/#369 (0.5.0): prompt-cache reuse across growing, edited,
+#     session-independent conversations -- what the cache-hit line reports on.
 
 
 def clear_stale_state():
@@ -124,7 +138,8 @@ def latest_gufo_progress(log_text: str):
     """Parse gufo's --log-progress output into scheduler-authoritative live
     state, or None when the backend is not gufo or the flag is off.
 
-    Shapes (verified against engine b722a61):
+    Shapes (verified against engine b722a61; re-verified unchanged on 0.5.0 /
+    23cacbb, 2026-10-02):
       [progress] request=1 phase=prefill tokens=113664/134093 percentage=84.8 \
                  chunk_tps=791.9 avg_tps=842.1
       [progress] request=2 phase=decode tokens=351/600 percentage=58.5 \
@@ -237,6 +252,13 @@ def fetch_metrics(port: int, timeout=2):
             values["prompt_tps"] = num
         elif parts[0] == "llamacpp:predicted_tokens_seconds":
             values["decode_tps"] = num
+        # gufo 0.4.0+ (#351): these gauges report admitted vs waiting requests.
+        # kv_cache_usage_ratio exists too but upstream calls it a placeholder
+        # ("do not use for capacity or admission decisions"), so it stays unread.
+        elif parts[0] == "llamacpp:requests_processing":
+            values["requests_processing"] = int(num)
+        elif parts[0] == "llamacpp:requests_deferred":
+            values["requests_deferred"] = int(num)
     return port, values
 
 
@@ -250,9 +272,12 @@ def fetch_port_status(port, timeout=2):
 
 
 def gufo_activity(state_cache, port, metrics, now_ts, inflight_active):
-    # gufo advances its Prometheus counters only when a request completes, so
-    # infer the phase from per-poll deltas and replay the last observed phase
-    # briefly while a long request keeps running (counters frozen mid-request).
+    # Before 0.4.0 gufo advanced its Prometheus counters only when a request
+    # completed, so the phase came from per-poll deltas and was replayed while a
+    # request ran. Since #351 (0.4.0) the counters advance per prefill chunk and
+    # per generated token, so deltas below track the live phase; the short replay
+    # after a zero-delta poll now only covers a stalled poll or a draining
+    # scheduler, where counters genuinely freeze mid-request.
     gen_total = metrics.get("gen_total")
     prompt_total = metrics.get("prompt_total")
     if not isinstance(gen_total, int) or not isinstance(prompt_total, int):
@@ -296,6 +321,49 @@ def clear_gufo_state(state_cache, live_ports=None):
     live = {f"gf_prev:{port}" for port in (live_ports or [])}
     for key in [k for k in state_cache if k.startswith("gf_") and k not in live]:
         del state_cache[key]
+
+
+GUFO_COMPLETED_RE = re.compile(
+    r"event=completed.*prompt_tokens=(\d+).*cached_tokens=(\d+)"
+    r"(?:.*\bttft_ms=([\d.]+))?(?:.*\bdecode_tps=([\d.]+))?"
+)
+
+
+def latest_completed_stats(log_text):
+    """Newest gufo `[http] event=completed` line as a last-request summary.
+
+    Shape (gufo 0.5.0): `... status=200 duration_ms=... prompt_tokens=12
+    prefill_tokens=0 generated_tokens=8 finish=length cache=memory
+    cached_tokens=12 cache_restore_ms=3.1 ... ttft_ms=3.6 prefill_tps=0.0
+    decode_tps=30.9 ...`
+
+    `cache=` is an explicit memory/miss verdict and `cached_tokens` gives the
+    prefix-reuse rate -- the cache-hit number llm-watch's action list asks the
+    operator to record; `decode_tps` is the request's own decode rate.
+    The SSE snapshot can replay recent upstream lines on every poll,
+    so stamp the entry with gufo's own UTC line timestamp (not wall-clock now)
+    or the sticky window would never age out. Returns the newest matching line.
+    """
+    best = None
+    for line in log_text.splitlines():
+        if "event=completed" not in line or "cached_tokens=" not in line:
+            continue
+        m = GUFO_COMPLETED_RE.search(line)
+        if not m:
+            continue
+        prompt = int(m.group(1))
+        cached = int(m.group(2))
+        entry = {
+            "prompt": prompt,
+            "cached": cached,
+            "hit_pct": int(round(cached * 100.0 / prompt)) if prompt else 0,
+            "ttft_ms": float(m.group(3)) if m.group(3) else None,
+            "decode_tps": float(m.group(4)) if m.group(4) else None,
+            "ts": gufo_progress_epoch(line) or time.time(),
+        }
+        if best is None or entry["ts"] >= best["ts"]:
+            best = entry
+    return best
 
 
 def parse_outer_event(raw_payload: str):
@@ -588,6 +656,11 @@ log_activity = latest_upstream_activity(upstream_log)
 # Authoritative gufo progress (engine >= b722a61 with --log-progress). Wins over
 # the Prometheus-delta inference below, which can only guess the phase.
 gufo_prog = latest_gufo_progress(upstream_log)
+completed_stats = latest_completed_stats(upstream_log)
+if completed_stats:
+    # upstream_log is a live window: persist the summary with its timestamp so
+    # the Idle line can keep showing it after the line itself stops arriving.
+    state_cache["last_completed"] = completed_stats
 if ports:
     with ThreadPoolExecutor(max_workers=len(ports)) as pool:
         futures = [pool.submit(fetch_port_status, port, 0.25) for port in ports]
@@ -605,6 +678,14 @@ if ports:
                 slot_activity = active
                 slot_model = ports.get(port)
                 break
+
+#351 queue gauge: the max deferred (waiting for one of the --sessions 2
+# execution sessions) across gufo ports, surfaced on the Busy label.
+gufo_deferred = 0
+for _m in gufo_ports.values():
+    _d = _m.get("requests_deferred")
+    if isinstance(_d, (int, float)) and _d > gufo_deferred:
+        gufo_deferred = int(_d)
 
 inflight_active, inflight_model, inflight_elapsed, inflight_n = inflight_busy_info(inflight)
 
@@ -712,6 +793,8 @@ if has_live_activity:
             label = f"🟡 Prompt {prompt_pct}%"
         elif inflight_active:
             label = f"🟡 {fmt_busy(inflight_elapsed, inflight_n)}"
+            if gufo_deferred > 0:
+                label += f" · {gufo_deferred} queued"
         else:
             label = "🟡 Prompt"
 
@@ -766,11 +849,22 @@ elif stopping:
         state_cache["last_total"] = total
     save_state(state_cache)
 else:
+    idle_tail = ""
+    last_done = state_cache.get("last_completed")
+    if isinstance(last_done, dict):
+        if now_ts - float(last_done.get("ts", 0)) <= LAST_STATS_STICKY_SECONDS:
+            parts = [f"last {int(last_done.get('hit_pct', 0))}% cached"]
+            dt = last_done.get("decode_tps")
+            if isinstance(dt, (int, float)) and dt > 0.05:
+                parts.append(f"{dt:.0f} tok/s")
+            idle_tail = " · " + " ".join(parts)
+        else:
+            state_cache.pop("last_completed", None)
     if total is None:
-        out_line = f"🟢 Idle · {loaded} loaded"
+        out_line = f"🟢 Idle · {loaded} loaded{idle_tail}"
         print(out_line)
     else:
-        out_line = f"🟢 Idle · {loaded} loaded / {total}"
+        out_line = f"🟢 Idle · {loaded} loaded / {total}{idle_tail}"
         print(out_line)
     clear_stale_state()
     clear_gufo_state(state_cache, gufo_ports)
